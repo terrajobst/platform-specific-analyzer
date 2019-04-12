@@ -96,13 +96,13 @@ namespace Analyzer1
                     case OperationKind.ObjectCreation:
                     {
                         var op = (IObjectCreationOperation)context.Operation;
-                        CheckForPortability(context, op.Constructor);
+                        AnalyzeSymbolUsage(context, op.Constructor);
                         break;
                     }
                     case OperationKind.Invocation:
                     {
                         var op = (IInvocationOperation)context.Operation;
-                        CheckForPortability(context, op.TargetMethod);
+                        AnalyzeSymbolUsage(context, op.TargetMethod);
                         break;
                     }
                     case OperationKind.MethodReference:
@@ -110,13 +110,13 @@ namespace Analyzer1
                     case OperationKind.EventReference:
                     {
                         var op = (IMemberReferenceOperation)context.Operation;
-                        CheckForPortability(context, op.Member);
+                        AnalyzeSymbolUsage(context, op.Member);
                         break;
                     }
                     case OperationKind.Throw:
                     {
                         var op = (IThrowOperation)context.Operation;
-                        CheckForPlatformNotSupportedException(context, op.Exception.Type);
+                        AnalyzeThrowOperation(context, op);
                         break;
                     }
 
@@ -125,7 +125,7 @@ namespace Analyzer1
                 }
             }
 
-            private void CheckForPortability(OperationAnalysisContext context, ISymbol symbol)
+            private void AnalyzeSymbolUsage(OperationAnalysisContext context, ISymbol symbol)
             {
                 // Let's be defensive
 
@@ -135,68 +135,54 @@ namespace Analyzer1
                 // If the symbol isn't marked as platform-specific, this analyzer doesn't have
                 // to do any work.
 
-                if (!TryGetPlatformLimitations(symbol, out var referencedLimitations))
+                var referencedLimitations = GetDeclaredPlatforms(symbol);
+                if (!referencedLimitations.Any)
                     return;
 
-                // Now if the method we're calling from is marked to be platform-specific. If so,
-                // then the called method needs to support all platforms we're specific for.
+                // Let's see what the calling method is annotated as platform-specific and wether
+                // the calling code is inside a platform-guard.
 
-                var callSiteLimitations = new List<string>();
+                var declaredLimitations = GetDeclaredPlatforms(context.ContainingSymbol);
+                var guardedPlatforms = GetGuardedPlatforms(context.Operation);
 
-                if (TryGetPlatformGuards(context.Operation, out var guardedPlatforms))
+                // If we found guarded platforms, we generally prefer those over any annoations.
+                // That makes sense, because the guard will either be more specific or unreachable.
+
+                var callSiteLimitations = guardedPlatforms.Any ? guardedPlatforms : declaredLimitations;
+
+                if (declaredLimitations.Any && guardedPlatforms.Any)
                 {
-                    callSiteLimitations.AddRange(guardedPlatforms);
+                    // OK, the method we're calling from is platform-specific and a guard is in place.
+                    // Let's see whether the guard checks for any platform we're running on. If not,
+                    // the code behehind the guard isn't reachable.
 
-                    if (TryGetPlatformLimitations(context.ContainingSymbol, out var declaredLimitations))
-                    {
-                        // OK, the method we're calling from is platform-specific and a guard is in place.
-                        // Let's see whether the guard checks for any platform we're running on. If not,
-                        // the code behehind the guard isn't reachable.
+                    // TODO: We should mark unreachable guards (via WellKnownDiagnosticTags.Unnecessary).
+                    //       If all guards are unreachable, we should mark the entire contents of the if
+                    //       block as unreachable.
+                    //
+                    //       I don't think we'll want to do this here; rather we should do this directly
+                    //       in TryGetPlatformGuards(). For that to work, we'd need to pass the declared
+                    //       platform limitations.
 
-                        // TODO: We should mark unreachable guards (via WellKnownDiagnosticTags.Unnecessary).
-                        //       If all guards are unreachable, we should mark the entire contents of the if
-                        //       block as unreachable.
-                        //
-                        //       I don't think we'll want to do this here; rather we should do this directly
-                        //       in TryGetPlatformGuards(). For that to work, we'd need to pass the declared
-                        //       platform limitations.
-
-                        var reachable = false;
-
-                        foreach (var g in guardedPlatforms)
-                        {
-                            if (declaredLimitations.Contains(g))
-                                reachable = true;
-                        }
-
-                        if (!reachable)
-                            return;
-                    }
-                }
-                else
-                {
-                    if (TryGetPlatformLimitations(context.ContainingSymbol, out var declaredLimitations))
-                    {
-                        callSiteLimitations.AddRange(declaredLimitations);
-                    }
+                    if (!declaredLimitations.ContainsAny(guardedPlatforms))
+                        return;
                 }
 
-                if (callSiteLimitations.Any())
+                if (callSiteLimitations.Any)
                 {
                     // The call site is platform-specific as is the referenced symbol. That means that
                     // the reference method needs to support all platforms the call site is specific to.
 
-                    foreach (var p in referencedLimitations)
-                        callSiteLimitations.Remove(p);
+                    callSiteLimitations.RemoveAll(referencedLimitations);
 
-                    if (callSiteLimitations.Count == 0)
+                    if (!callSiteLimitations.Any)
                         return;
 
                     // The symbol doesn't support all the platforms that the call site is supported on.
                     // Report all missing ones.
 
                     var formattedSymbol = symbol.ToDisplayString(_symbolDisplayFormat);
-                    var formattedLimitations = string.Join(", ", callSiteLimitations.Select(p => "'" + p + "'"));
+                    var formattedLimitations = callSiteLimitations.ToString();
                     var location = context.Operation.Syntax.GetLocation();
                     var diagnostic = Diagnostic.Create(_pc0002, location, formattedSymbol, formattedLimitations);
                     context.ReportDiagnostic(diagnostic);
@@ -207,46 +193,52 @@ namespace Analyzer1
                     // a diagnostic.
 
                     var formattedSymbol = symbol.ToDisplayString(_symbolDisplayFormat);
-                    var formattedPlatforms = string.Join(", ", referencedLimitations.Select(p => "'" + p + "'"));
+                    var formattedPlatforms = referencedLimitations.ToString();
                     var location = context.Operation.Syntax.GetLocation();
                     var diagnostic = Diagnostic.Create(_pc0001, location, formattedSymbol, formattedPlatforms);
                     context.ReportDiagnostic(diagnostic);
                 }
             }
 
-            private bool TryGetPlatformLimitations(ISymbol symbol, out List<string> platforms)
+            private PlatformList GetDeclaredPlatforms(ISymbol symbol)
             {
-                if (TryGetPlatformLimitationsDirect(symbol, out platforms))
+                TryGetDeclaredPlatforms(symbol, out var platforms);
+                return platforms;
+            }
+
+            private bool TryGetDeclaredPlatforms(ISymbol symbol, out PlatformList platforms)
+            {
+                if (TryGetDeclaredPlatformsDirect(symbol, out platforms))
                     return true;
 
                 switch (symbol.Kind)
                 {
                     case SymbolKind.NetModule:
                         var module = (IModuleSymbol)symbol;
-                        return TryGetPlatformLimitations(module.ContainingAssembly, out platforms);
+                        return TryGetDeclaredPlatforms(module.ContainingAssembly, out platforms);
                     case SymbolKind.NamedType:
                         var type = (ITypeSymbol)symbol;
                         if (type.ContainingType != null)
-                            return TryGetPlatformLimitations(type.ContainingType, out platforms);
+                            return TryGetDeclaredPlatforms(type.ContainingType, out platforms);
                         else
-                            return TryGetPlatformLimitations(type.ContainingModule, out platforms);
+                            return TryGetDeclaredPlatforms(type.ContainingModule, out platforms);
                     case SymbolKind.Method:
                         var method = (IMethodSymbol)symbol;
-                        return TryGetPlatformLimitations(method.ContainingType, out platforms);
+                        return TryGetDeclaredPlatforms(method.ContainingType, out platforms);
                     case SymbolKind.Property:
                         var property = (IPropertySymbol)symbol;
-                        return TryGetPlatformLimitations(property.ContainingType, out platforms);
+                        return TryGetDeclaredPlatforms(property.ContainingType, out platforms);
                     case SymbolKind.Event:
                         var @event = (IEventSymbol)symbol;
-                        return TryGetPlatformLimitations(@event.ContainingType, out platforms);
+                        return TryGetDeclaredPlatforms(@event.ContainingType, out platforms);
                 }
 
                 return false;
             }
 
-            private bool TryGetPlatformLimitationsDirect(ISymbol symbol, out List<string> platforms)
+            private bool TryGetDeclaredPlatformsDirect(ISymbol symbol, out PlatformList platforms)
             {
-                platforms = null;
+                platforms = new PlatformList();
 
                 var assembly = symbol is IAssemblySymbol a ? a : symbol.ContainingAssembly;
                 var platformSpecificAttribute = LookupPlatformSpecificAttribute(assembly);
@@ -258,47 +250,33 @@ namespace Analyzer1
                         if (ca.ConstructorArguments.Length == 1 &&
                             ca.ConstructorArguments[0].Value is string platform)
                         {
-                            if (platforms == null)
-                                platforms = new List<string>();
-
                             platforms.Add(platform);
                         }
                     }
                 }
 
-                if (platforms != null)
-                {
-                    // This reads better but also ensures that we have a deterministic text
-                    // for the diagnostics.
-                    platforms.Sort();
-                }
-
-                return platforms != null;
+                return platforms.Any;
             }
 
-            private bool TryGetPlatformGuards(IOperation operation, out List<string> platformGuards)
+            private PlatformList GetGuardedPlatforms(IOperation operation)
             {
-                List<string> platformGuardBuilder = null;
+                var platformGuards = new PlatformList();
 
                 while (operation != null)
                 {
                     if (operation is IConditionalOperation conditional)
                     {
-                        if (TryGetPlatformGuardFromCondition(conditional.Condition, ref platformGuardBuilder))
-                        {
-                            platformGuards = platformGuardBuilder;
-                            return true;
-                        }
+                        if (TryGetGuardedPlatformsFromCondition(conditional.Condition, ref platformGuards))
+                            break;
                     }
 
                     operation = operation.Parent;
                 }
 
-                platformGuards = null;
-                return false;
+                return platformGuards;
             }
 
-            private bool TryGetPlatformGuardFromCondition(IOperation condition, ref List<string> platformGuardBuilder)
+            private bool TryGetGuardedPlatformsFromCondition(IOperation condition, ref PlatformList platformList)
             {
                 switch (condition.Kind)
                 {
@@ -308,8 +286,8 @@ namespace Analyzer1
                         if (binary.OperatorKind == BinaryOperatorKind.Or ||
                             binary.OperatorKind == BinaryOperatorKind.ConditionalOr)
                         {
-                            return TryGetPlatformGuardFromCondition(binary.LeftOperand, ref platformGuardBuilder) &&
-                                   TryGetPlatformGuardFromCondition(binary.RightOperand, ref platformGuardBuilder);
+                            return TryGetGuardedPlatformsFromCondition(binary.LeftOperand, ref platformList) &&
+                                   TryGetGuardedPlatformsFromCondition(binary.RightOperand, ref platformList);
                         }
                         break;
                     }
@@ -317,8 +295,12 @@ namespace Analyzer1
                     case OperationKind.Invocation:
                     {
                         var invocation = (IInvocationOperation) condition;
-                        if (TryGetPlatformGuadFromInvocation(invocation, ref platformGuardBuilder))
+                        var platform = GetCheckedPlatform(invocation);
+                        if (platform != null)
+                        {
+                            platformList.Add(platform);
                             return true;
+                        }
                         break;
                     }
                 }
@@ -326,29 +308,25 @@ namespace Analyzer1
                 return false;
             }
 
-            private bool TryGetNegatedPlatformGuard(IOperation operation, out List<string> platformGuards)
+            private PlatformList GetRejectedPlatforms(IOperation operation)
             {
-                List<string> platformGuardBuilder = null;
+                var platformList = new PlatformList();
 
                 while (operation != null)
                 {
                     if (operation is IConditionalOperation conditional)
                     {
-                        if (TryGetNegatedPlatformGuardFromCondition(conditional.Condition, ref platformGuardBuilder))
-                        {
-                            platformGuards = platformGuardBuilder;
-                            return true;
-                        }
+                        if (TryGetRejectedPlatformsFromCondition(conditional.Condition, ref platformList))
+                            break;
                     }
 
                     operation = operation.Parent;
                 }
 
-                platformGuards = null;
-                return false;
+                return platformList;
             }
 
-            private bool TryGetNegatedPlatformGuardFromCondition(IOperation condition, ref List<string> platformGuardBuilder)
+            private bool TryGetRejectedPlatformsFromCondition(IOperation condition, ref PlatformList platformList)
             {
                 switch (condition.Kind)
                 {
@@ -358,8 +336,8 @@ namespace Analyzer1
                         if (binary.OperatorKind == BinaryOperatorKind.And ||
                             binary.OperatorKind == BinaryOperatorKind.ConditionalAnd)
                         {
-                            return TryGetNegatedPlatformGuardFromCondition(binary.LeftOperand, ref platformGuardBuilder) &&
-                                   TryGetNegatedPlatformGuardFromCondition(binary.RightOperand, ref platformGuardBuilder);
+                            return TryGetRejectedPlatformsFromCondition(binary.LeftOperand, ref platformList) &&
+                                   TryGetRejectedPlatformsFromCondition(binary.RightOperand, ref platformList);
                         }
                         
                         break;
@@ -371,8 +349,12 @@ namespace Analyzer1
                         if (unary.OperatorKind == UnaryOperatorKind.Not &&
                             unary.Operand is IInvocationOperation invocation)
                         {
-                            if (TryGetPlatformGuadFromInvocation(invocation, ref platformGuardBuilder))
+                            var platform = GetCheckedPlatform(invocation);
+                            if (platform != null)
+                            {
+                                platformList.Add(platform);
                                 return true;
+                            }
                         }
 
                         break;
@@ -382,45 +364,48 @@ namespace Analyzer1
                 return false;
             }
 
-            private bool TryGetPlatformGuadFromInvocation(IInvocationOperation invocation, ref List<string> platformGuardBuilder)
+            private string GetCheckedPlatform(IInvocationOperation invocation)
             {
                 if (invocation.TargetMethod == _isOSPlatformMethod &&
                     invocation.Arguments[0].Value is IPropertyReferenceOperation propertyReference &&
                     propertyReference.Property.Type == _osPlatformType)
                 {
-                    if (platformGuardBuilder == null)
-                        platformGuardBuilder = new List<string>();
-
-                    platformGuardBuilder.Add(propertyReference.Property.Name);
-                    return true;
+                    return propertyReference.Property.Name;
                 }
 
-                return false;
+                return null;
             }
 
-            private void CheckForPlatformNotSupportedException(OperationAnalysisContext context, ITypeSymbol exceptionType)
+            private void AnalyzeThrowOperation(OperationAnalysisContext context, IThrowOperation operation)
             {
-                if (exceptionType != _platformNotSupportedException)
+                if (operation.Exception.Type != _platformNotSupportedException)
                     return;
 
-                if (!TryGetNegatedPlatformGuard(context.Operation, out var platformGuards))
+                var rejectedPlatforms = GetRejectedPlatforms(operation);
+
+                // If we couldn't find any rejected platforms then the throw operation wasn't
+                // inside an if that checked for the absence of specific platforms.
+
+                if (!rejectedPlatforms.Any)
                     return;
 
-                if (TryGetPlatformLimitations(context.ContainingSymbol, out var declaredPlatforms))
-                {
-                    foreach (var declaredPlatform in declaredPlatforms)
-                        platformGuards.Remove(declaredPlatform);
+                // To check wether we didn't annoate them, we'll subtract the declared platforms
+                // from the rejected ones.
 
-                    if (platformGuards.Count == 0)
-                        return;
-                }
+                var declaredPlatforms = GetDeclaredPlatforms(context.ContainingSymbol);
+                rejectedPlatforms.RemoveAll(declaredPlatforms);
 
-                // The method throws for certain platforms but the method isn't marked as platform-specific.
+                // If there aren't any left, that means we annoated them all.
+
+                if (!rejectedPlatforms.Any)
+                    return;
+
+                // Alright, we missed some. Report them.
 
                 var symbol = context.ContainingSymbol;
                 var formattedSymbol = symbol.ToDisplayString(_symbolDisplayFormat);
-                var formattedPlatforms = string.Join(", ", platformGuards.Select(p => "'" + p + "'"));
-                var location = context.Operation.Syntax.GetLocation();
+                var formattedPlatforms = rejectedPlatforms.ToString();
+                var location = operation.Syntax.GetLocation();
                 var diagnostic = Diagnostic.Create(_pc0003, location, formattedSymbol, formattedPlatforms);
                 context.ReportDiagnostic(diagnostic);
             }
@@ -434,6 +419,64 @@ namespace Analyzer1
                 }
 
                 return result;
+            }
+        }
+
+        private struct PlatformList
+        {
+            private List<string> _platforms;
+
+            public PlatformList(List<string> platforms)
+            {
+                _platforms = platforms;
+            }
+
+            public bool Any => _platforms != null && _platforms.Count > 0;
+
+            public IEnumerable<string> Items => _platforms == null ? Enumerable.Empty<string>() : _platforms;
+
+            public void Add(string platform)
+            {
+                if (_platforms == null)
+                    _platforms = new List<string>();
+
+                _platforms.Add(platform);
+            }
+
+            public void RemoveAll(PlatformList other)
+            {
+                RemoveAll(other._platforms);
+            }
+
+            public void RemoveAll(IEnumerable<string> platforms)
+            {
+                if (!Any || platforms == null)
+                    return;
+
+                foreach (var p in platforms)
+                    _platforms.Remove(p);
+            }
+
+            public bool ContainsAny(PlatformList other)
+            {
+                if (!Any || !other.Any)
+                    return false;
+
+                foreach (var p in other._platforms)
+                    if (_platforms.Contains(p))
+                        return true;
+
+                return false;
+            }
+
+            public override string ToString()
+            {
+                if (!Any)
+                    return string.Empty;
+
+                // We're sorting because it reads better but also ensures that we have a
+                // deterministic text for the diagnostics.
+                return string.Join(", ", _platforms.OrderBy(p => p).Select(p => "'" + p + "'"));
             }
         }
     }
